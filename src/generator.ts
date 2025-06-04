@@ -360,8 +360,18 @@ function generateStandaloneInterface(ast: TNamedInterface, options: Options): st
 }
 
 function generateStandaloneType(ast: ASTWithStandaloneName, options: Options): string {
+  let comment = ast.comment
+  
+  // For arrays, include item description in the comment if it exists
+  if (ast.type === 'ARRAY' && hasComment(ast.params)) {
+    const itemComment = ast.params.comment
+    if (itemComment) {
+      comment = comment ? `${comment}\n\nArray items:\n${itemComment}` : `Array items:\n${itemComment}`
+    }
+  }
+  
   return (
-    (hasComment(ast) ? generateComment(ast.comment) + '\n' : '') +
+    (comment ? generateComment(comment, ast.deprecated) + '\n' : '') +
     `export type ${toSafeString(ast.standaloneName)} = ${generateType(
       omit<AST>(ast, 'standaloneName') as AST /* TODO */,
       options,
