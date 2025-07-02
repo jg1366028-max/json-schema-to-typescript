@@ -182,7 +182,7 @@ export function stripExtension(filename: string): string {
  * Convert a string that might contain spaces or special characters to one that
  * can safely be used as a TypeScript interface or enum name.
  */
-export function toSafeString(string: string) {
+export function toSafeString(string: string): string {
   // identifiers in javaScript/ts:
   // First character: a-zA-Z | _ | $
   // Rest: a-zA-Z | _ | $ | 0-9
@@ -219,7 +219,7 @@ export function generateName(from: string, usedNames: Set<string>): string {
       nameWithCounter = `${name}${counter}`
       counter++
     }
-    name = nameWithCounter as any
+    name = nameWithCounter
   }
 
   usedNames.add(name)
