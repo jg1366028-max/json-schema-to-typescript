@@ -1,56 +1,19 @@
-import {deburr, isPlainObject, trim, upperFirst} from 'lodash'
+import {cloneDeep, deburr, isPlainObject, trim, upperFirst} from 'lodash'
 import {basename, dirname, extname, normalize, sep, posix} from 'path'
-import {Intersection, JSONSchema, LinkedJSONSchema, NormalizedJSONSchema, Parent} from './types/JSONSchema'
+import {
+  Intersection,
+  JSONSchema,
+  JSONSchemaTypeName,
+  LinkedJSONSchema,
+  NormalizedJSONSchema,
+  Parent,
+} from './types/JSONSchema'
+import {memoize} from './memoize'
 import {JSONSchema4} from 'json-schema'
-import yaml from 'js-yaml'
+import {binaryTag, CORE_SCHEMA, load as loadYaml, mergeTag, omapTag, pairsTag, setTag, timestampTag} from 'js-yaml'
 import type {Format} from 'cli-color'
-
-// TODO: pull out into a separate package
-export function Try<T>(fn: () => T, err: (e: Error) => any): T {
-  try {
-    return fn()
-  } catch (e) {
-    return err(e as Error)
-  }
-}
-
-// keys that shouldn't be traversed by the catchall step
-const BLACKLISTED_KEYS = new Set([
-  'id',
-  '$defs',
-  '$id',
-  '$schema',
-  'title',
-  'description',
-  'default',
-  'multipleOf',
-  'maximum',
-  'exclusiveMaximum',
-  'minimum',
-  'exclusiveMinimum',
-  'maxLength',
-  'minLength',
-  'pattern',
-  'additionalItems',
-  'items',
-  'maxItems',
-  'minItems',
-  'uniqueItems',
-  'maxProperties',
-  'minProperties',
-  'required',
-  'additionalProperties',
-  'definitions',
-  'properties',
-  'patternProperties',
-  'dependencies',
-  'enum',
-  'type',
-  'allOf',
-  'anyOf',
-  'oneOf',
-  'not',
-])
+import type {Options} from './'
+import {CONTAINER_KEYWORDS, JSON_DATA_KEYWORDS, NOT_SCANNED_FOR_DEFINITIONS, SUBSCHEMA_KEYWORDS} from './keywords'
 
 function traverseObjectKeys(
   obj: Record<string, LinkedJSONSchema>,
@@ -72,25 +35,8 @@ function traverseArray(
   arr.forEach((s, k) => traverse(s, callback, processed, k.toString()))
 }
 
-function traverseIntersection(
-  schema: LinkedJSONSchema,
-  callback: (schema: LinkedJSONSchema, key: string | null) => void,
-  processed: Set<LinkedJSONSchema>,
-) {
-  if (typeof schema !== 'object' || !schema) {
-    return
-  }
-
-  const r = schema as unknown as Record<string | symbol, unknown>
-  const intersection = r[Intersection] as NormalizedJSONSchema | undefined
-  if (!intersection) {
-    return
-  }
-
-  if (Array.isArray(intersection.allOf)) {
-    traverseArray(intersection.allOf, callback, processed)
-  }
-}
+/** Each subschema keyword's position in `traverse`'s visiting order */
+const SUBSCHEMA_KEYWORD_ORDER = new Map(SUBSCHEMA_KEYWORDS.map(([keyword], order) => [keyword as string, order]))
 
 export function traverse(
   schema: LinkedJSONSchema,
@@ -106,69 +52,135 @@ export function traverse(
   processed.add(schema)
   callback(schema, key ?? null)
 
-  if (schema.anyOf) {
-    traverseArray(schema.anyOf, callback, processed)
-  }
-  if (schema.allOf) {
-    traverseArray(schema.allOf, callback, processed)
-  }
-  if (schema.oneOf) {
-    traverseArray(schema.oneOf, callback, processed)
-  }
-  if (schema.properties) {
-    traverseObjectKeys(schema.properties, callback, processed)
-  }
-  if (schema.patternProperties) {
-    traverseObjectKeys(schema.patternProperties, callback, processed)
-  }
-  if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
-    traverse(schema.additionalProperties, callback, processed)
-  }
-  if (schema.items) {
-    const {items} = schema
-    if (Array.isArray(items)) {
-      traverseArray(items, callback, processed)
-    } else {
-      traverse(items, callback, processed)
+  // One look at the node's own keys (rather than a probe for every subschema keyword there is,
+  // most of which any one node lacks) finds the subschema keywords it has, visited first in
+  // keyword-table order, and the keys that definitions may technically sit under, visited after
+  const subschemaKeywords: number[] = []
+  const otherKeys: string[] = []
+  for (const key of Object.keys(schema)) {
+    const order = SUBSCHEMA_KEYWORD_ORDER.get(key)
+    if (order !== undefined) {
+      subschemaKeywords.push(order)
+    }
+    if (!NOT_SCANNED_FOR_DEFINITIONS.has(key)) {
+      otherKeys.push(key)
     }
   }
-  if (schema.additionalItems && typeof schema.additionalItems === 'object') {
-    traverse(schema.additionalItems, callback, processed)
-  }
-  if (schema.dependencies) {
-    if (Array.isArray(schema.dependencies)) {
-      traverseArray(schema.dependencies, callback, processed)
-    } else {
-      traverseObjectKeys(schema.dependencies as LinkedJSONSchema, callback, processed)
-    }
-  }
-  if (schema.definitions) {
-    traverseObjectKeys(schema.definitions, callback, processed)
-  }
-  if (schema.$defs) {
-    traverseObjectKeys(schema.$defs, callback, processed)
-  }
-  if (schema.not) {
-    traverse(schema.not, callback, processed)
-  }
-  traverseIntersection(schema, callback, processed)
 
-  // technically you can put definitions on any key
-  Object.keys(schema)
-    .filter(key => !BLACKLISTED_KEYS.has(key))
-    .forEach(key => {
-      const child = schema[key]
-      if (child && typeof child === 'object') {
+  for (const i of subschemaKeywords.sort((a, b) => a - b)) {
+    const [keyword, holds] = SUBSCHEMA_KEYWORDS[i]
+    const child = schema[keyword]
+    if (!child) {
+      continue
+    }
+    switch (holds) {
+      case 'schema':
+        traverse(child, callback, processed)
+        break
+      case 'schemaOrBoolean':
+        if (typeof child === 'object') {
+          traverse(child, callback, processed)
+        }
+        break
+      case 'schemaOrSchemaArray':
+        if (Array.isArray(child)) {
+          traverseArray(child, callback, processed)
+        } else {
+          traverse(child, callback, processed)
+        }
+        break
+      case 'schemaArray':
+        traverseArray(child, callback, processed)
+        break
+      case 'schemaMap':
         traverseObjectKeys(child, callback, processed)
+        break
+    }
+  }
+  const intersection = (schema as NormalizedJSONSchema)[Intersection]
+  if (intersection && Array.isArray(intersection.allOf)) {
+    traverseArray(intersection.allOf, callback, processed)
+  }
+
+  for (const key of otherKeys) {
+    const child = schema[key]
+    if (child && typeof child === 'object') {
+      traverseObjectKeys(child, callback, processed)
+    }
+  }
+}
+
+/**
+ * Walks every object/array reachable from `schema`, invoking `visit` on each plain
+ * object node found outside instance data (`enum`, `default`...). `replace` swaps the node out in
+ * its parent container, in place (a no-op for the root node, which has no parent).
+ * Where `traverse` knows which keywords hold schemas and visits each node once, this
+ * walk is keyword-agnostic (container objects such as a `properties` map are visited
+ * too) and per occurrence:
+ *
+ * the same node object can be reachable from more than one parent/key (eg. two
+ * schemas sharing a `$ref` node via a YAML alias, or a node the ref-parser already
+ * folded into a cycle), so `visit` runs for every occurrence. Only the recursion
+ * into a node's children is guarded against repeating -- via `seen` -- to keep
+ * cycles from looping forever.
+ */
+export function eachSchemaNode(
+  schema: unknown,
+  visit: (node: JSONSchema, replace: (nextNode: JSONSchema) => void) => void,
+  seen = new Set<unknown>(),
+  parent?: any,
+  key?: string,
+): void {
+  if (!schema || typeof schema !== 'object') {
+    return
+  }
+
+  if (!Array.isArray(schema)) {
+    visit(schema as JSONSchema, nextNode => {
+      if (parent) {
+        parent[key!] = nextNode
       }
     })
+  }
+
+  if (seen.has(schema)) {
+    return
+  }
+  seen.add(schema)
+
+  for (const childKey of Object.keys(schema)) {
+    // instance data, never a nested schema, so an `$id`/`$ref` (or anything else) found
+    // underneath is not schema vocabulary
+    if (JSON_DATA_KEYWORDS.has(childKey)) {
+      continue
+    }
+    eachSchemaNode((schema as any)[childKey], visit, seen, schema, childKey)
+  }
 }
 
 /**
  * Eg. `foo/bar/baz.json` => `baz`
+ *
+ * `$ref`s that point into a document (eg `other.json#/definitions/v1.Foo` or
+ * `#/definitions/v1.Foo`) are not file paths, so the part after `#` is a JSON
+ * Pointer, not a filename with an extension: any `.` it contains is part of the
+ * name and must not be stripped as though it were a file extension.
  */
 export function justName(filename = ''): string {
+  const hashIndex = filename.indexOf('#')
+  if (hashIndex !== -1) {
+    return basename(filename.slice(hashIndex + 1))
+  }
   return stripExtension(basename(filename))
+}
+
+/** The name a schema asks for, before `generateName` makes it safe and unique */
+export function nameOf(
+  schema: LinkedJSONSchema,
+  keyNameFromDefinition: string | undefined,
+  options: Options,
+): string | undefined {
+  return options.customName?.(schema, keyNameFromDefinition) || schema.title || schema.$id || keyNameFromDefinition
 }
 
 /**
@@ -182,7 +194,7 @@ export function stripExtension(filename: string): string {
  * Convert a string that might contain spaces or special characters to one that
  * can safely be used as a TypeScript interface or enum name.
  */
-export function toSafeString(string: string) {
+export function toSafeString(string: string): string {
   // identifiers in javaScript/ts:
   // First character: a-zA-Z | _ | $
   // Rest: a-zA-Z | _ | $ | 0-9
@@ -201,9 +213,30 @@ export function toSafeString(string: string) {
       // uppercase first letter after whitespace
       .replace(/\s+([a-zA-Z])/g, match => trim(match.toUpperCase()))
       // remove remaining whitespace
-      .replace(/\s/g, ''),
+      .replace(/\s/g, '')
+      // strip any leading digits: they're valid elsewhere in an identifier, but
+      // never as the first character (this can be exposed after prior chars are stripped above)
+      .replace(/^\d+/, ''),
   )
 }
+
+// The next counter to try for each name, per `usedNames` set, so that the search for a free name
+// carries on where the last one ended instead of counting up from 1 for every duplicate (a schema
+// with thousands of same-named types -- one copy of a definition per `$ref` that has a sibling
+// keyword, say -- would otherwise probe 1 + 2 + ... + n names). Names are only ever added to
+// `usedNames`, so every smaller counter is still taken and the result is the same smallest free
+// counter that counting from 1 would find.
+const nextCounters = memoize<Set<string>, [], Map<string, number>>(() => new Map())
+
+/**
+ * Built-in type names a generated type must not take, or it shadows the global for the whole
+ * file (`export type Symbol = string` -- #386). A name that lands here gets the same counter
+ * suffix as a duplicate (`Symbol1`). Deliberately short: the built-ins from lib.es5 /
+ * lib.es2015 that read as TypeScript's own types in an annotation, minus the ones real-world
+ * schemas use as type names on purpose (`Date`, `Error`, `Function`, `String`, `Number`,
+ * `Boolean`), which are left as the schema author wrote them.
+ */
+const RESERVED_TYPE_NAMES = new Set(['Array', 'Map', 'Object', 'Promise', 'RegExp', 'Set', 'Symbol'])
 
 export function generateName(from: string, usedNames: Set<string>) {
   let name = toSafeString(from)
@@ -211,15 +244,15 @@ export function generateName(from: string, usedNames: Set<string>) {
     name = 'NoName'
   }
 
-  // increment counter until we find a free name
-  if (usedNames.has(name)) {
-    let counter = 1
-    let nameWithCounter = `${name}${counter}`
-    while (usedNames.has(nameWithCounter)) {
-      nameWithCounter = `${name}${counter}`
+  // taken or reserved: increment counter until we find a free name
+  if (usedNames.has(name) || RESERVED_TYPE_NAMES.has(name)) {
+    const counters = nextCounters(usedNames)
+    let counter = counters.get(name) ?? 1
+    while (usedNames.has(`${name}${counter}`)) {
       counter++
     }
-    name = nameWithCounter
+    counters.set(name, counter + 1)
+    name = `${name}${counter}`
   }
 
   usedNames.add(name)
@@ -228,15 +261,26 @@ export function generateName(from: string, usedNames: Set<string>) {
 
 export function error(...messages: any[]): void {
   if (!process.env.VERBOSE) {
-    return console.error(messages)
+    return console.error('error:', ...messages)
   }
   console.error(getStyledTextForLogging('red')?.('error'), ...messages)
 }
 
 type LogStyle = 'blue' | 'cyan' | 'green' | 'magenta' | 'red' | 'white' | 'yellow'
 
+/**
+ * Whether `log()` prints: the VERBOSE environment variable, re-read at the start of every
+ * `compile()` (`readVerbose`) rather than on every call -- `log()` is called for every schema
+ * node and every generated type, and a `process.env` read is not free.
+ */
+let verbose = Boolean(process.env.VERBOSE)
+
+export function readVerbose(): void {
+  verbose = Boolean(process.env.VERBOSE)
+}
+
 export function log(style: LogStyle, title: string, ...messages: unknown[]): void {
-  if (!process.env.VERBOSE) {
+  if (!verbose) {
     return
   }
   let lastMessage = null
@@ -271,21 +315,6 @@ function getStyledTextForLogging(style: LogStyle): ((text: string) => string) | 
   }
 }
 
-/**
- * escape block comments in schema descriptions so that they don't unexpectedly close JSDoc comments in generated typescript interfaces
- */
-export function escapeBlockComment(schema: JSONSchema) {
-  const replacer = '* /'
-  if (schema === null || typeof schema !== 'object') {
-    return
-  }
-  for (const key of Object.keys(schema)) {
-    if (key === 'description' && typeof schema[key] === 'string') {
-      schema[key] = schema[key]!.replace(/\*\//g, replacer)
-    }
-  }
-}
-
 /*
 the following logic determines the out path by comparing the in path to the users specified out path.
 For example, if input directory MultiSchema looks like:
@@ -305,59 +334,57 @@ export function pathTransform(outputPath: string, inputPath: string, filePath: s
   return posix.join(posix.normalize(outputPath), ...filePathRel)
 }
 
-/**
- * Removes the schema's `default` property if it doesn't match the schema's `type` property.
- * Useful when parsing unions.
- *
- * Mutates `schema`.
- */
-export function maybeStripDefault(schema: LinkedJSONSchema): LinkedJSONSchema {
-  if (!('default' in schema)) {
-    return schema
-  }
-
-  switch (schema.type) {
-    case 'array':
-      if (Array.isArray(schema.default)) {
-        return schema
-      }
-      break
-    case 'boolean':
-      if (typeof schema.default === 'boolean') {
-        return schema
-      }
-      break
-    case 'integer':
-    case 'number':
-      if (typeof schema.default === 'number') {
-        return schema
-      }
-      break
-    case 'string':
-      if (typeof schema.default === 'string') {
-        return schema
-      }
-      break
-    case 'null':
-      if (schema.default === null) {
-        return schema
-      }
-      break
-    case 'object':
-      if (isPlainObject(schema.default)) {
-        return schema
-      }
-      break
-  }
-  delete schema.default
-  return schema
+export function hasType(schema: JSONSchema, type: JSONSchemaTypeName): boolean {
+  return schema.type === type || (Array.isArray(schema.type) && schema.type.includes(type))
 }
 
-export function appendToDescription(existingDescription: string | undefined, ...values: string[]): string {
-  if (existingDescription) {
-    return `${existingDescription}\n\n${values.join('\n')}`
+type TypeKeyword = JSONSchemaTypeName | JSONSchemaTypeName[]
+
+/**
+ * What is left of `schema`'s `type` once a schema of type `bound` must hold too (`integer` being
+ * the whole-number part of `number`): `false` if no type is left, the narrower `type` if some of
+ * it goes, `undefined` if `bound` takes nothing away (or `schema` declares no `type` to narrow).
+ */
+export function narrowType(schema: JSONSchema | boolean, bound: TypeKeyword): TypeKeyword | false | undefined {
+  if (typeof schema !== 'object' || !schema || schema.type === undefined || schema.type === 'any') {
+    return undefined
   }
-  return values.join('\n')
+  const bounds: readonly JSONSchemaTypeName[] = Array.isArray(bound) ? bound : [bound]
+  if (bounds.includes('any')) {
+    return undefined
+  }
+  const types: readonly JSONSchemaTypeName[] = Array.isArray(schema.type) ? schema.type : [schema.type]
+  const narrowed = types.flatMap((type): JSONSchemaTypeName[] =>
+    bounds.includes(type) || (type === 'integer' && bounds.includes('number'))
+      ? [type]
+      : type === 'number' && bounds.includes('integer')
+        ? ['integer']
+        : [],
+  )
+  if (!narrowed.length) {
+    return false
+  }
+  if (narrowed.length === types.length && narrowed.every((type, i) => type === types[i])) {
+    return undefined
+  }
+  return narrowed.length === 1 ? narrowed[0] : narrowed
+}
+
+/**
+ * Whether a value of type `bound` can match `schema` as far as `type`s go: its own, and those of
+ * its `anyOf`/`oneOf` members (a boolean schema admits everything or nothing).
+ */
+export function admitsType(schema: JSONSchema | boolean, bound: TypeKeyword, seen = new Set<JSONSchema>()): boolean {
+  if (typeof schema !== 'object' || !schema || seen.has(schema)) {
+    return schema !== false
+  }
+  if (narrowType(schema, bound) === false) {
+    return false
+  }
+  seen.add(schema)
+  return (['anyOf', 'oneOf'] as const).every(
+    key => schema[key]?.some(member => admitsType(member, bound, seen)) ?? true,
+  )
 }
 
 export function isSchemaLike(schema: any): schema is LinkedJSONSchema {
@@ -371,46 +398,40 @@ export function isSchemaLike(schema: any): schema is LinkedJSONSchema {
     return true
   }
 
-  const JSON_SCHEMA_KEYWORDS = [
-    '$defs',
-    'allOf',
-    'anyOf',
-    'definitions',
-    'dependencies',
-    'enum',
-    'not',
-    'oneOf',
-    'patternProperties',
-    'properties',
-    'required',
-  ]
-  if (JSON_SCHEMA_KEYWORDS.some(_ => parent[_] === schema)) {
-    return false
+  for (const keyword of CONTAINER_KEYWORDS) {
+    if (parent[keyword] === schema) {
+      return false
+    }
   }
-
   return true
 }
 
+/**
+ * js-yaml@5 loads with CORE_SCHEMA by default, which drops the extra tags that
+ * js-yaml@4's default schema carried. Re-add exactly those tags so that YAML
+ * schemas keep parsing the way they did under js-yaml@4.
+ *
+ * Note that YAML11_SCHEMA is NOT the right choice here: on top of these tags it
+ * also enables the YAML 1.1 scalar notations, under which `y`, `n`, `yes`, `no`,
+ * `on` and `off` resolve to booleans, `0777` is octal, and `12:30` is
+ * sexagesimal. That silently rewrites property names (a property called `y`
+ * becomes `true`) and enum values, which js-yaml@4 never did.
+ */
+const JS_YAML_4_SCHEMA = CORE_SCHEMA.withTags(mergeTag, timestampTag, binaryTag, omapTag, pairsTag, setTag)
+
 export function parseFileAsJSONSchema(filename: string | null, contents: string): JSONSchema4 {
-  if (filename != null && isYaml(filename)) {
-    return Try(
-      () => yaml.load(contents.toString()) as JSONSchema4,
-      () => {
-        throw new TypeError(`Error parsing YML in file "${filename}"`)
-      },
-    )
+  if (filename != null && (filename.endsWith('.yaml') || filename.endsWith('.yml'))) {
+    try {
+      return loadYaml(contents, {schema: JS_YAML_4_SCHEMA}) as JSONSchema4
+    } catch {
+      throw new TypeError(`Error parsing YML in file "${filename}"`)
+    }
   }
-
-  return Try(
-    () => JSON.parse(contents.toString()),
-    () => {
-      throw new TypeError(`Error parsing JSON in file "${filename}"`)
-    },
-  )
-}
-
-function isYaml(filename: string) {
-  return filename.endsWith('.yaml') || filename.endsWith('.yml')
+  try {
+    return JSON.parse(contents)
+  } catch {
+    throw new TypeError(`Error parsing JSON in file "${filename}"`)
+  }
 }
 
 function color(): Format {
@@ -419,4 +440,65 @@ function color(): Format {
     cliColor = require('cli-color')
   } catch {}
   return cliColor
+}
+
+/** The TypeScript type the `formatTypes` option maps this schema's `format` to, if any */
+export function formatTypeOf(schema: JSONSchema, options: Options): string | undefined {
+  return typeof schema.format === 'string' && Object.prototype.hasOwnProperty.call(options.formatTypes, schema.format)
+    ? options.formatTypes[schema.format]
+    : undefined
+}
+
+/**
+ * Deep-copies a schema so that compiling never touches the caller's object.
+ * The arrays and plain objects it is made of -- the nodes `link` annotates and
+ * the normalizer rewrites, i.e. nearly all of any schema -- are copied here, by
+ * their own enumerable string keys. The rare value that is neither (a `Date`
+ * from a YAML timestamp, a `RegExp` or class instance under a custom keyword)
+ * is handed to lodash's `cloneDeep`, because `traverse` may still reach it and
+ * stamp it; what lodash cannot copy (a function, an `Error`) is carried over by
+ * reference, as it was when lodash copied the whole schema. A node reachable
+ * along several paths, or through a cycle, is copied exactly once, so the copy
+ * shares structure wherever the input does.
+ *
+ * lodash's `cloneDeep` used to do all of this, but its seen-set fails its own
+ * "is `Map` native" check under bun (see memoize.ts) and falls back to a list it
+ * scans linearly, making the clone quadratic in the number of schema nodes:
+ * 37 of the 43 seconds a 10,000-definition schema took to compile.
+ */
+export function cloneDeepPlain<T>(value: T, copies = new Map<object, unknown>()): T {
+  if (typeof value !== 'object' || value === null) {
+    return value
+  }
+  const copied = copies.get(value)
+  if (copied !== undefined) {
+    return copied as T
+  }
+  if (Array.isArray(value)) {
+    const copy: unknown[] = new Array(value.length)
+    copies.set(value, copy)
+    for (let i = 0; i < value.length; i++) {
+      copy[i] = cloneDeepPlain(value[i], copies)
+    }
+    return copy as T
+  }
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null && !isPlainObject(value)) {
+    // Copied as an array member so that lodash hands back what it cannot copy instead of `{}`
+    const [copy] = cloneDeep([value])
+    copies.set(value, copy)
+    return copy
+  }
+  const copy: Record<string, unknown> = {}
+  copies.set(value, copy)
+  for (const key of Object.keys(value)) {
+    const member = cloneDeepPlain((value as Record<string, unknown>)[key], copies)
+    if (key === '__proto__') {
+      // An own `__proto__` key (JSON.parse makes those) must stay an own key, not set the prototype
+      Object.defineProperty(copy, key, {value: member, writable: true, enumerable: true, configurable: true})
+    } else {
+      copy[key] = member
+    }
+  }
+  return copy as T
 }

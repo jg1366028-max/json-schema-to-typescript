@@ -1,5 +1,5 @@
 import {JSONSchema4, JSONSchema4Type, JSONSchema4TypeName} from 'json-schema'
-import {isPlainObject, memoize} from 'lodash'
+import {isPlainObject} from 'lodash'
 
 export type SchemaType =
   | 'ALL_OF'
@@ -25,6 +25,8 @@ export type SchemaType =
 export type JSONSchemaTypeName = JSONSchema4TypeName
 export type JSONSchemaType = JSONSchema4Type
 
+export const DefinitionKey = Symbol('DefinitionKey')
+
 export interface JSONSchema extends JSONSchema4 {
   /**
    * schema extension to support numeric enums
@@ -38,9 +40,34 @@ export interface JSONSchema extends JSONSchema4 {
    * property exists at least in https://json-schema.org/draft/2019-09/json-schema-validation.html#rfc.section.9.3
    */
   deprecated?: boolean
+  /**
+   * draft 7+ annotation (also OpenAPI): the value is managed by the owning authority
+   * @see https://json-schema.org/draft-07/json-schema-validation#rfc.section.10.3
+   */
+  readOnly?: boolean
+  /**
+   * The name the parser declares this schema under: the (first) key it is held under in
+   * the root schema's `$defs`, set by the normalizer once the definitions are final; or,
+   * failing that, the key it had in the `definitions`/`$defs` of the separate file it was
+   * dereferenced from, set by the resolver -- once merged into the referencing document
+   * those maps no longer sit at the root (or are not part of the document at all, for a
+   * `file.json#/definitions/X` pointer), so this is how such an entry keeps its name (#143).
+   */
+  [DefinitionKey]?: string
 }
 
 export const Parent = Symbol('Parent')
+export const Shared = Symbol('Shared')
+/**
+ * Where a schema node was read from: the file (as the resolver addressed it) and the
+ * JSON Pointer inside that file. Only stamped when compiling a set of files together
+ * (the `imports` mode); absent otherwise.
+ */
+export const Source = Symbol('Source')
+export interface SchemaSource {
+  file: string
+  pointer: string
+}
 
 export interface LinkedJSONSchema extends JSONSchema {
   /**
@@ -48,10 +75,24 @@ export interface LinkedJSONSchema extends JSONSchema {
    * `null` when this is the root schema.
    */
   [Parent]: LinkedJSONSchema | null
+  /**
+   * Set on a schema that is reachable from more than one parent node (the
+   * target of a `$ref`, usually), whose `Parent` is just the first one found.
+   */
+  [Shared]?: true
+  [Source]?: SchemaSource
 
   additionalItems?: boolean | LinkedJSONSchema
   additionalProperties?: boolean | LinkedJSONSchema
+  /**
+   * @see https://json-schema.org/draft/2019-09/json-schema-core.html#rfc.section.9.3.2.4
+   */
+  unevaluatedProperties?: boolean | LinkedJSONSchema
   items?: LinkedJSONSchema | LinkedJSONSchema[]
+  /**
+   * @see https://json-schema.org/draft/2020-12/json-schema-core#section-10.3.1.1
+   */
+  prefixItems?: LinkedJSONSchema[]
   definitions?: {
     [k: string]: LinkedJSONSchema
   }
@@ -76,9 +117,10 @@ export const Intersection = Symbol('Intersection')
 /**
  * Normalized JSON schema.
  *
- * Note: `definitions` and `id` are removed by the normalizer. Use `$defs` and `$id` instead.
+ * Note: `definitions`, `id` and `prefixItems` are removed by the normalizer. Use `$defs`, `$id`
+ * and `items`/`additionalItems` instead.
  */
-export interface NormalizedJSONSchema extends Omit<LinkedJSONSchema, 'definitions' | 'id'> {
+export interface NormalizedJSONSchema extends Omit<LinkedJSONSchema, 'definitions' | 'id' | 'prefixItems'> {
   [Intersection]?: NormalizedJSONSchema
   [Parent]: NormalizedJSONSchema | null
   [Types]: ReadonlySet<SchemaType>
@@ -103,7 +145,10 @@ export interface NormalizedJSONSchema extends Omit<LinkedJSONSchema, 'definition
   anyOf?: NormalizedJSONSchema[]
   oneOf?: NormalizedJSONSchema[]
   not?: NormalizedJSONSchema
-  required: string[]
+  /**
+   * `false` is normalized to `[]`; `true` is the draft 3 property-level form (see `isRequired` in the parser)
+   */
+  required: string[] | true
 }
 
 export interface EnumJSONSchema extends NormalizedJSONSchema {
@@ -118,7 +163,6 @@ export interface SchemaSchema extends NormalizedJSONSchema {
   properties: {
     [k: string]: NormalizedJSONSchema
   }
-  required: string[]
 }
 
 export interface JSONSchemaWithDefinitions extends NormalizedJSONSchema {
@@ -131,14 +175,6 @@ export interface CustomTypeJSONSchema extends NormalizedJSONSchema {
   tsType: string
 }
 
-export const getRootSchema = memoize((schema: NormalizedJSONSchema): NormalizedJSONSchema => {
-  const parent = schema[Parent]
-  if (!parent) {
-    return schema
-  }
-  return getRootSchema(parent)
-})
-
 export function isBoolean(schema: LinkedJSONSchema | JSONSchemaType): schema is boolean {
   return schema === true || schema === false
 }
@@ -148,5 +184,5 @@ export function isPrimitive(schema: LinkedJSONSchema | JSONSchemaType): schema i
 }
 
 export function isCompound(schema: JSONSchema): boolean {
-  return Array.isArray(schema.type) || 'anyOf' in schema || 'oneOf' in schema
+  return Array.isArray(schema.type) || 'allOf' in schema || 'anyOf' in schema || 'oneOf' in schema
 }

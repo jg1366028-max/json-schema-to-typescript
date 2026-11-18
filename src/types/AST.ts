@@ -1,4 +1,5 @@
 import {JSONSchema4Type} from 'json-schema'
+import type {SchemaSource} from './JSONSchema'
 
 export type AST_TYPE = AST['type']
 
@@ -15,7 +16,6 @@ export type AST =
   | TNumber
   | TNull
   | TObject
-  | TReference
   | TString
   | TTuple
   | TUnion
@@ -28,6 +28,17 @@ export interface AbstractAST {
   standaloneName?: string
   type: AST_TYPE
   deprecated?: boolean
+  /**
+   * Set on ASTs produced from `unreachableDefinitions`, so the generator knows to declare
+   * them even though they aren't the root type and aren't reachable via `$ref`.
+   */
+  isUnreachableDefinition?: boolean
+  /**
+   * The file and JSON Pointer this type's schema was read from. Only set in `imports`
+   * mode, where the generator uses it to import a type its own file declares instead of
+   * declaring a copy.
+   */
+  source?: SchemaSource
 }
 
 export type ASTWithComment = AST & {comment: string}
@@ -42,8 +53,29 @@ export function hasComment(ast: AST): ast is ASTWithComment {
   )
 }
 
+/**
+ * A literal, or a union of nothing but literals: what a `const` or an inline `enum` parses to.
+ */
+export function isLiteralUnion(ast: AST): boolean {
+  return ast.type === 'LITERAL' || (ast.type === 'UNION' && ast.params.every(_ => _.type === 'LITERAL'))
+}
+
 export function hasStandaloneName(ast: AST): ast is ASTWithStandaloneName {
   return 'standaloneName' in ast && ast.standaloneName != null && ast.standaloneName !== ''
+}
+
+// TODO: More clearly disambiguate standalone names vs. aliased names instead.
+// Note: enums are kept as-is — an ENUM without its standaloneName is unrenderable.
+export function omitStandaloneName<A extends AST>(ast: A): A {
+  switch (ast.type) {
+    case 'ENUM':
+      return ast
+    default: {
+      const unnamed = {...ast}
+      delete unnamed.standaloneName
+      return unnamed
+    }
+  }
 }
 
 ////////////////////////////////////////////     types
@@ -55,6 +87,8 @@ export interface TAny extends AbstractAST {
 export interface TArray extends AbstractAST {
   type: 'ARRAY'
   params: AST
+  /** The array schema is annotated `readOnly: true` */
+  isReadOnly?: boolean
 }
 
 export interface TBoolean extends AbstractAST {
@@ -78,11 +112,8 @@ export interface TInterface extends AbstractAST {
   superTypes: TNamedInterface[]
 }
 
-export interface TNamedInterface extends AbstractAST {
+export interface TNamedInterface extends TInterface {
   standaloneName: string
-  type: 'INTERFACE'
-  params: TInterfaceParam[]
-  superTypes: TNamedInterface[]
 }
 
 export interface TNever extends AbstractAST {
@@ -95,6 +126,12 @@ export interface TInterfaceParam {
   isRequired: boolean
   isPatternProperty: boolean
   isUnreachableDefinition: boolean
+  // True for the synthesized `[k: string]` index signature param, as opposed to a
+  // named property that happens to be called "[k: string]".
+  isIndexSignature: boolean
+  // The property schema is annotated `readOnly: true` (for the index signature: every
+  // schema folded into it is)
+  isReadOnly?: boolean
 }
 
 export interface TIntersection extends AbstractAST {
@@ -119,11 +156,6 @@ export interface TObject extends AbstractAST {
   type: 'OBJECT'
 }
 
-export interface TReference extends AbstractAST {
-  type: 'REFERENCE'
-  params: string
-}
-
 export interface TString extends AbstractAST {
   type: 'STRING'
 }
@@ -134,6 +166,8 @@ export interface TTuple extends AbstractAST {
   spreadParam?: AST
   minItems: number
   maxItems?: number
+  /** The array schema is annotated `readOnly: true` */
+  isReadOnly?: boolean
 }
 
 export interface TUnion extends AbstractAST {
@@ -161,6 +195,11 @@ export const T_ANY_ADDITIONAL_PROPERTIES: TAny & ASTWithName = {
   type: 'ANY',
 }
 
+export const T_UNDEFINED: TCustomType = {
+  params: 'undefined',
+  type: 'CUSTOM_TYPE',
+}
+
 export const T_UNKNOWN: TUnknown = {
   type: 'UNKNOWN',
 }
@@ -168,4 +207,9 @@ export const T_UNKNOWN: TUnknown = {
 export const T_UNKNOWN_ADDITIONAL_PROPERTIES: TUnknown & ASTWithName = {
   keyName: '[k: string]',
   type: 'UNKNOWN',
+}
+
+export const T_NEVER_ADDITIONAL_PROPERTIES: TNever & ASTWithName = {
+  keyName: '[k: string]',
+  type: 'NEVER',
 }

@@ -9,8 +9,14 @@
 !.yarn/versions
 npm-debug.log
 node_modules
+package-lock.json
 *.js
 *.map
 dist/
 dist_tests/
 yarn-error.log
+bench/profiles/
+
+# written by `bun run fuzz:ci` and the `output` CI job
+fuzz-report.json
+conformance-report.json

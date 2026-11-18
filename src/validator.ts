@@ -16,6 +16,13 @@ rules.set('tsEnumNames must be an array of strings', schema => {
   }
 })
 
+// Two members of one enum cannot share a name (TS2300 "Duplicate identifier")
+rules.set('tsEnumNames must not contain duplicates', schema => {
+  if (schema.tsEnumNames) {
+    return new Set(schema.tsEnumNames).size === schema.tsEnumNames.length
+  }
+})
+
 rules.set('When both maxItems and minItems are present, maxItems >= minItems', schema => {
   const {maxItems, minItems} = schema
   if (typeof maxItems === 'number' && typeof minItems === 'number') {
@@ -43,14 +50,14 @@ rules.set('deprecated must be a boolean', schema => {
 })
 
 export function validate(schema: LinkedJSONSchema, filename: string): string[] {
-  const errors: string[] = []
-  rules.forEach((rule, ruleName) => {
-    traverse(schema, (schema, key) => {
+  // All rules share one walk over the schema; errors are still listed rule by rule
+  const checks = [...rules].map(([ruleName, rule]) => ({ruleName, rule, errors: [] as string[]}))
+  traverse(schema, (schema, key) => {
+    for (const {ruleName, rule, errors} of checks) {
       if (rule(schema) === false) {
         errors.push(`Error at key "${key}" in file "${filename}": ${ruleName}`)
       }
-      return schema
-    })
+    }
   })
-  return errors
+  return checks.flatMap(_ => _.errors)
 }

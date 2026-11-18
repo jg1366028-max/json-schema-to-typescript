@@ -1,5 +1,15 @@
 import {isPlainObject} from 'lodash'
-import {isCompound, JSONSchema, SchemaType} from './types/JSONSchema'
+import {STRUCTURAL_KEYWORDS} from './keywords'
+import {
+  Intersection,
+  isCompound,
+  JSONSchema,
+  LinkedJSONSchema,
+  Parent,
+  SchemaType,
+  Source,
+  Types,
+} from './types/JSONSchema'
 
 /**
  * Duck types a JSONSchema schema or property to determine which kind of AST node to parse it into.
@@ -23,28 +33,105 @@ export function typesOfSchema(schema: JSONSchema): Set<SchemaType> {
     }
   }
 
-  // Default to an unnamed schema
+  // A schema no matcher recognizes is an object if one of its keywords still gives it a shape (a
+  // `required` list), and otherwise -- only bounds on values (`pattern`, `maximum`), annotations,
+  // applicators this tool doesn't implement (`not`, `if`), or keys it doesn't know -- says nothing
+  // about which type a value is, like the empty schema
   if (!matchedTypes.size) {
-    matchedTypes.add('UNNAMED_SCHEMA')
+    matchedTypes.add(isShapeless(schema) ? 'ANY' : 'UNNAMED_SCHEMA')
   }
 
   return matchedTypes
 }
 
-const matchers: Record<SchemaType, (schema: JSONSchema) => boolean> = {
+/**
+ * Whether any matcher recognizes the schema. One that none does has no way to be
+ * typed on its own: it only gets the default at the bottom of `typesOfSchema`.
+ */
+export function hasOwnType(schema: JSONSchema): boolean {
+  return Boolean(schema.tsType) || Object.values(matchers).some(f => f(schema))
+}
+
+/**
+ * No keyword of the schema gives it a shape (see `STRUCTURAL_KEYWORDS`). A `$ref` the resolver
+ * could not resolve is still there and still stands for a type: the parser reports it.
+ */
+export function isShapeless(schema: JSONSchema): boolean {
+  return !('$ref' in schema) && Object.keys(schema).every(key => !STRUCTURAL_KEYWORDS.has(key))
+}
+
+/**
+ * The schema says what an object's members are -- it declares `properties` or
+ * `patternProperties`, or types the rest with an `additionalProperties` schema -- and its `type`
+ * lets that apply: it is `object` or absent (object keywords alone read as an object, by this
+ * tool's convention). Under any other `type` those keywords constrain nothing -- JSON Schema
+ * applies them only to values that are objects -- so they give the schema no object shape; that
+ * includes an array `type`, whose `UNION` case in `parser.ts` re-parses the schema once per
+ * member type. `additionalProperties` counts only when it types something: `true` or `{}` is
+ * the open object any schema without these keywords already is, and `false` may be nothing
+ * but the `additionalProperties` option's default.
+ */
+function hasObjectShape(schema: JSONSchema): boolean {
+  return (
+    (schema.type === undefined || schema.type === 'object') &&
+    ('patternProperties' in schema ||
+      'properties' in schema ||
+      (isPlainObject(schema.additionalProperties) && !isShapeless(schema.additionalProperties as JSONSchema)))
+  )
+}
+
+/**
+ * Works out the schema's types (see `typesOfSchema`) once, ahead of parsing, and records them
+ * on it as `[Types]`. A schema that is several types at once is emitted as their intersection:
+ * it gets a companion `ALL_OF` schema, `[Intersection]`, that takes over its `allOf` (if any)
+ * and its `$id`, `title`, `description` and `name`, so that the name and comment land on the
+ * intersection rather than on each member; the parser adds one member per type to it. It is
+ * built here rather than in the parser because the parser caches ASTs by schema object, so the
+ * intersection has to be one object, not a new one per visit.
+ *
+ * Mutates `schema`.
+ */
+export function applySchemaTyping(schema: LinkedJSONSchema): void {
+  const types = typesOfSchema(schema)
+  Object.defineProperty(schema, Types, {enumerable: false, value: types, writable: false})
+  if (types.size === 1) {
+    return
+  }
+
+  const intersection = {
+    [Parent]: schema,
+    // The intersection stands for the schema as a whole, so it is what other files import
+    [Source]: schema[Source],
+    [Types]: new Set(['ALL_OF']),
+    $id: schema.$id,
+    description: schema.description,
+    name: schema.name,
+    title: schema.title,
+    allOf: schema.allOf ?? [],
+    required: [],
+    additionalProperties: false,
+  }
+  types.delete('ALL_OF')
+  delete schema.allOf
+  delete schema.$id
+  delete schema.description
+  delete schema.name
+  delete schema.title
+  Object.defineProperty(schema, Intersection, {enumerable: false, value: intersection, writable: false})
+}
+
+const matchers: Record<Exclude<SchemaType, 'CUSTOM_TYPE'>, (schema: JSONSchema) => boolean> = {
   ALL_OF(schema) {
     return 'allOf' in schema
   },
   ANY(schema) {
-    if (Object.keys(schema).length === 0) {
-      // The empty schema {} validates any value
-      // @see https://json-schema.org/draft-07/json-schema-core.html#rfc.section.4.3.1
-      return true
-    }
-    return schema.type === 'any'
+    return schema.type === 'any' // for the empty schema and its likes, see `typesOfSchema`
   },
   ANY_OF(schema) {
-    return 'anyOf' in schema
+    // An array `type` makes the schema a `UNION`, whose case in `parser.ts` applies the
+    // `anyOf` within each type: also matching here would intersect that union with the
+    // `anyOf` parsed as if the schema had no `type`
+    return 'anyOf' in schema && !Array.isArray(schema.type)
   },
   BOOLEAN(schema) {
     if ('enum' in schema) {
@@ -53,26 +140,29 @@ const matchers: Record<SchemaType, (schema: JSONSchema) => boolean> = {
     if (schema.type === 'boolean') {
       return true
     }
-    if (!isCompound(schema) && typeof schema.default === 'boolean') {
+    // Only infer BOOLEAN from `default` when `type` isn't declared as
+    // something else; an explicit `type` always takes precedence over the
+    // type of `default` (see #434).
+    if (schema.type === undefined && !isCompound(schema) && typeof schema.default === 'boolean') {
       return true
     }
     return false
-  },
-  CUSTOM_TYPE() {
-    return false // Explicitly handled before we try to match
   },
   NAMED_ENUM(schema) {
     return 'enum' in schema && 'tsEnumNames' in schema
   },
   NAMED_SCHEMA(schema) {
     // 8.2.1. The presence of "$id" in a subschema indicates that the subschema constitutes a distinct schema resource within a single schema document.
-    return '$id' in schema && ('patternProperties' in schema || 'properties' in schema)
+    return '$id' in schema && hasObjectShape(schema)
   },
   NEVER(schema: JSONSchema | boolean) {
     return schema === false
   },
   NULL(schema) {
-    return schema.type === 'null'
+    // `type: null` isn't valid JSON-Schema (`type` must be a string or an
+    // array of strings), but it's an easy mistake to make (eg. an unquoted
+    // `null` in YAML), and the most plausible intent is `type: "null"`.
+    return schema.type === 'null' || schema.type === null
   },
   NUMBER(schema) {
     if ('enum' in schema) {
@@ -81,7 +171,10 @@ const matchers: Record<SchemaType, (schema: JSONSchema) => boolean> = {
     if (schema.type === 'integer' || schema.type === 'number') {
       return true
     }
-    if (!isCompound(schema) && typeof schema.default === 'number') {
+    // Only infer NUMBER from `default` when `type` isn't declared as
+    // something else; an explicit `type` always takes precedence over the
+    // type of `default` (see #434).
+    if (schema.type === undefined && !isCompound(schema) && typeof schema.default === 'number') {
       return true
     }
     return false
@@ -99,7 +192,7 @@ const matchers: Record<SchemaType, (schema: JSONSchema) => boolean> = {
     )
   },
   ONE_OF(schema) {
-    return 'oneOf' in schema
+    return 'oneOf' in schema && !Array.isArray(schema.type) // as for ANY_OF
   },
   REFERENCE(schema) {
     return '$ref' in schema
@@ -111,7 +204,10 @@ const matchers: Record<SchemaType, (schema: JSONSchema) => boolean> = {
     if (schema.type === 'string') {
       return true
     }
-    if (!isCompound(schema) && typeof schema.default === 'string') {
+    // Only infer STRING from `default` when `type` isn't declared as
+    // something else; an explicit `type` always takes precedence over the
+    // type of `default` (see #434).
+    if (schema.type === undefined && !isCompound(schema) && typeof schema.default === 'string') {
       return true
     }
     return false
@@ -140,8 +236,13 @@ const matchers: Record<SchemaType, (schema: JSONSchema) => boolean> = {
     }
     return 'enum' in schema
   },
-  UNNAMED_SCHEMA() {
-    return false // Explicitly handled as the default case
+  UNNAMED_SCHEMA(schema) {
+    // Mirrors NAMED_SCHEMA above: a schema's own `properties`/`patternProperties`
+    // are a real type even without a `$id`, so they get intersected with any
+    // sibling `allOf`/`anyOf`/`oneOf` instead of being silently dropped. Schemas that
+    // don't otherwise match anything still fall through to the default case at
+    // the bottom of `typesOfSchema`.
+    return !('$id' in schema) && hasObjectShape(schema)
   },
   UNTYPED_ARRAY(schema) {
     return schema.type === 'array' && !('items' in schema)
